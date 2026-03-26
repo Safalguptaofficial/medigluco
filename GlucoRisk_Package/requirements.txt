@@ -1,0 +1,5 @@
+pyserial
+rich
+flask
+werkzeug
+numpy

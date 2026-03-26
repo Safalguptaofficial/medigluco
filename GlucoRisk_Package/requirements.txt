@@ -10,3 +10,4 @@ flask-wtf
 flask-limiter
 reportlab
 gunicorn
+paho-mqtt

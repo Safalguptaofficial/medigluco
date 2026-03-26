@@ -1,11 +1,53 @@
+/*
+ * GlucoRisk TinyML Edge Firmware
+ * ──────────────────────────────
+ * On-device MLP inference (8→16→8→4) + WiFi MQTT for fog gateway
+ * Sensors: MAX30102 (HR/SpO2) + MPU6050 (Accelerometer)
+ * 
+ * Architecture:
+ *   EDGE (this device) → MQTT → FOG GATEWAY → CLOUD SERVER
+ *   On-device inference runs even when WiFi is down (serial fallback)
+ */
+
+#include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
-#include <ArduinoJson.h>
 #include <MPU6050.h>
-#include <Wire.h>
+#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <math.h>
 
+// ═══════════════════════════════════════════════
+// MODEL WEIGHTS (from train_model.py)
+// MLP: Input(8) → Hidden(16,ReLU) → Hidden(8,ReLU) → Output(4,Softmax)
+// ═══════════════════════════════════════════════
+#include "model_weights.h"
+
+// ═══════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════
+// WiFi
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// MQTT Fog Gateway
+const char* MQTT_BROKER   = "192.168.1.100";  // Fog gateway IP
+const int   MQTT_PORT     = 1883;
+const char* PATIENT_ID    = "patient_001";     // Unique per device
+
+// Derived MQTT topics
+char TOPIC_VITALS[64];
+char TOPIC_ALERT[64];
+char TOPIC_MODEL[64];
+
+// ═══════════════════════════════════════════════
+// HARDWARE
+// ═══════════════════════════════════════════════
 MAX30105 particleSensor;
 MPU6050 mpu;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 // HR variables
 long lastBeat = 0;
@@ -13,98 +55,252 @@ float beatAvg = 0;
 long prevIR = 0;
 bool rising = false;
 
-// Activity mapping thresholds
-// accel < 1.1 → Rest (0), < 1.5 → Light (1), < 2.0 → Moderate (2), >= 2.0 →
-// Intense (3)
+// Patient defaults (can be updated via MQTT)
+float patient_age = 25.0;
+float patient_bmi = 22.0;
+
+// Risk labels
+const char* RISK_LABELS[] = {"NORMAL", "LOW_RISK", "MODERATE_RISK", "HIGH_RISK"};
+
+// ═══════════════════════════════════════════════
+// TinyML: MLP Forward Pass
+// ═══════════════════════════════════════════════
+
+float relu(float x) { return x > 0 ? x : 0; }
+
+void mlp_forward(float input[8], float output[4]) {
+  // Layer 1: input(8) → hidden1(16) with ReLU
+  float h1[16];
+  for (int j = 0; j < 16; j++) {
+    h1[j] = b1[j];
+    for (int i = 0; i < 8; i++) {
+      h1[j] += input[i] * W1[i * 16 + j];
+    }
+    h1[j] = relu(h1[j]);
+  }
+
+  // Layer 2: hidden1(16) → hidden2(8) with ReLU
+  float h2[8];
+  for (int j = 0; j < 8; j++) {
+    h2[j] = b2[j];
+    for (int i = 0; i < 16; i++) {
+      h2[j] += h1[i] * W2[i * 8 + j];
+    }
+    h2[j] = relu(h2[j]);
+  }
+
+  // Layer 3: hidden2(8) → output(4) with Softmax
+  float max_val = -1e9;
+  for (int j = 0; j < 4; j++) {
+    output[j] = b3[j];
+    for (int i = 0; i < 8; i++) {
+      output[j] += h2[i] * W3[i * 4 + j];
+    }
+    if (output[j] > max_val) max_val = output[j];
+  }
+
+  // Softmax normalization
+  float sum = 0;
+  for (int j = 0; j < 4; j++) {
+    output[j] = exp(output[j] - max_val);
+    sum += output[j];
+  }
+  for (int j = 0; j < 4; j++) {
+    output[j] /= sum;
+  }
+}
+
+int predict_risk(float glucose, float hr, float gsr, float spo2,
+                 float stress, float age, float bmi, float activity) {
+  // Scale inputs using training scaler parameters
+  float input[8] = {
+    (glucose - SCALER_MEAN[0]) / SCALER_STD[0],
+    (hr      - SCALER_MEAN[1]) / SCALER_STD[1],
+    (gsr     - SCALER_MEAN[2]) / SCALER_STD[2],
+    (spo2    - SCALER_MEAN[3]) / SCALER_STD[3],
+    (stress  - SCALER_MEAN[4]) / SCALER_STD[4],
+    (age     - SCALER_MEAN[5]) / SCALER_STD[5],
+    (bmi     - SCALER_MEAN[6]) / SCALER_STD[6],
+    (activity - SCALER_MEAN[7]) / SCALER_STD[7]
+  };
+
+  float output[4];
+  mlp_forward(input, output);
+
+  // Find argmax
+  int best = 0;
+  for (int i = 1; i < 4; i++) {
+    if (output[i] > output[best]) best = i;
+  }
+  return best;
+}
+
+// ═══════════════════════════════════════════════
+// MQTT CALLBACKS
+// ═══════════════════════════════════════════════
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // Handle model updates or patient config from fog gateway
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) return;
+
+  if (String(topic) == String(TOPIC_MODEL)) {
+    // Could update patient_age, patient_bmi from fog
+    if (doc.containsKey("age")) patient_age = doc["age"];
+    if (doc.containsKey("bmi")) patient_bmi = doc["bmi"];
+  }
+}
+
+void connectMQTT() {
+  if (mqttClient.connected()) return;
+  
+  String clientId = "glucorisk-" + String(PATIENT_ID);
+  if (mqttClient.connect(clientId.c_str())) {
+    mqttClient.subscribe(TOPIC_MODEL);
+  }
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+  }
+}
+
+// ═══════════════════════════════════════════════
+// SETUP
+// ═══════════════════════════════════════════════
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("{\"status\":\"booting\"}");
+  Serial.println("{\"status\":\"booting\",\"mode\":\"tinyml_edge\"}");
+
+  // Build MQTT topics
+  snprintf(TOPIC_VITALS, sizeof(TOPIC_VITALS), "glucorisk/patient/%s/vitals", PATIENT_ID);
+  snprintf(TOPIC_ALERT,  sizeof(TOPIC_ALERT),  "glucorisk/patient/%s/alert",  PATIENT_ID);
+  snprintf(TOPIC_MODEL,  sizeof(TOPIC_MODEL),  "glucorisk/patient/%s/config", PATIENT_ID);
 
   Wire.begin(D2, D1);
 
-  // MAX30102
+  // MAX30102 sensor
   if (!particleSensor.begin(Wire)) {
     Serial.println("{\"error\":\"MAX30102 not found\"}");
-    while (1)
-      ;
+    while (1);
   }
-
   particleSensor.setup();
   particleSensor.setPulseAmplitudeRed(0x2F);
   particleSensor.setPulseAmplitudeGreen(0);
 
-  // MPU6050
+  // MPU6050 sensor
   mpu.initialize();
   if (!mpu.testConnection()) {
     Serial.println("{\"error\":\"MPU6050 not found\"}");
   }
 
-  Serial.println("{\"status\":\"ready\"}");
+  // WiFi + MQTT (non-blocking — works without WiFi too)
+  WiFi.mode(WIFI_STA);
+  connectWiFi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  Serial.println("{\"status\":\"ready\",\"patient_id\":\"" + String(PATIENT_ID) + "\"}");
 }
 
-void loop() {
-  // ========================
-  // HEART RATE (MAX30102)
-  // ========================
-  long irValue = particleSensor.getIR();
+// ═══════════════════════════════════════════════
+// MAIN LOOP
+// ═══════════════════════════════════════════════
 
-  if (irValue > prevIR + 500) {
-    rising = true;
+void loop() {
+  // Maintain MQTT connection
+  if (WiFi.status() == WL_CONNECTED) {
+    connectMQTT();
+    mqttClient.loop();
   }
 
+  // ── Read Sensors ──
+  long irValue = particleSensor.getIR();
+
+  // Heart rate peak detection
+  if (irValue > prevIR + 500) rising = true;
   if (rising && irValue < prevIR) {
     long delta = millis() - lastBeat;
     lastBeat = millis();
-
     float bpm = 60.0 / (delta / 1000.0);
-
     if (bpm > 50 && bpm < 150) {
       beatAvg = (beatAvg * 0.7) + (bpm * 0.3);
     }
-
     rising = false;
   }
-
   prevIR = irValue;
 
-  // SpO2 estimation (simplified)
+  // SpO2 estimation
   int spo2 = 0;
   bool fingerDetected = (irValue > 50000);
   if (fingerDetected) {
-    spo2 = 95 + random(0, 4); // 95-98 range when finger on sensor
+    spo2 = 95 + random(0, 4);
   }
 
-  // ========================
-  // MPU6050 (MOTION)
-  // ========================
+  // Accelerometer → activity level
   int16_t ax, ay, az;
   mpu.getAcceleration(&ax, &ay, &az);
-  float accel =
-      sqrt((float)(ax * ax) + (float)(ay * ay) + (float)(az * az)) / 16384.0;
-
-  // Map accelerometer to activity level
+  float accel = sqrt((float)(ax*ax) + (float)(ay*ay) + (float)(az*az)) / 16384.0;
   int activity = 0;
-  if (accel >= 2.0)
-    activity = 3;
-  else if (accel >= 1.5)
-    activity = 2;
-  else if (accel >= 1.1)
-    activity = 1;
+  if (accel >= 2.0) activity = 3;
+  else if (accel >= 1.5) activity = 2;
+  else if (accel >= 1.1) activity = 1;
 
-  // ========================
-  // JSON OUTPUT (every 500ms)
-  // ========================
-  // Only emit valid readings when finger is on sensor
+  // ── TinyML Inference (on-device) ──
   if (fingerDetected && beatAvg > 0) {
-    StaticJsonDocument<200> doc;
+    // Simulate glucose/GSR (no physical sensor — would come from CGM in production)
+    float glucose = 100 + random(-20, 40);
+    float gsr = 400 + random(0, 300);
+    float stress = constrain(gsr / 100.0, 1, 10);
+
+    // Run MLP on-device
+    int risk_class = predict_risk(glucose, beatAvg, gsr, spo2,
+                                   stress, patient_age, patient_bmi, activity);
+    int score = (int)(risk_class * 33.3);
+
+    // Build JSON payload
+    StaticJsonDocument<512> doc;
+    doc["patient_id"] = PATIENT_ID;
     doc["heart_rate"] = (int)beatAvg;
     doc["spo2"] = spo2;
     doc["accel"] = accel;
     doc["activity"] = activity;
+    doc["glucose"] = glucose;
+    doc["gsr"] = (int)gsr;
+    doc["risk_edge"] = RISK_LABELS[risk_class];
+    doc["score_edge"] = score;
+    doc["source"] = "tinyml_edge";
     doc["ir"] = irValue;
+
+    // Always output to serial (fallback when no WiFi)
     serializeJson(doc, Serial);
     Serial.println();
+
+    // Publish to MQTT fog gateway if connected
+    if (mqttClient.connected()) {
+      char buffer[512];
+      serializeJson(doc, buffer);
+      mqttClient.publish(TOPIC_VITALS, buffer);
+
+      // Publish alert if HIGH_RISK
+      if (risk_class == 3) {
+        StaticJsonDocument<128> alert;
+        alert["patient_id"] = PATIENT_ID;
+        alert["risk"] = "HIGH_RISK";
+        alert["score"] = score;
+        alert["glucose"] = glucose;
+        char alertBuf[128];
+        serializeJson(alert, alertBuf);
+        mqttClient.publish(TOPIC_ALERT, alertBuf);
+      }
+    }
   }
 
   delay(500);

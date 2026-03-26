@@ -371,6 +371,7 @@
       <span class="nav-user">{{ session.get('username') }}</span>
       <a href="{{ url_for('profile') }}" class="nav-link" title="Patient Profile"><i class="bi bi-person-badge"></i></a>
       <a href="{{ url_for('history_page') }}" class="nav-link" title="History"><i class="bi bi-clock-history"></i></a>
+      <a href="{{ url_for('patients_view') }}" class="nav-link" title="Patients"><i class="bi bi-people"></i></a>
       <a href="{{ url_for('logout') }}" class="nav-link">logout</a>
     </div>
   </div>

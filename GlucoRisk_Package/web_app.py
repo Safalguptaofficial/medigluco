@@ -529,6 +529,99 @@ def api_stats():
     row = c.fetchone()
     return jsonify(dict(row) if row else {})
 
+# ── Federated Learning API ────────────────────────────────────
+from federated import FederatedServer, FederatedClient
+
+_fed_server = None
+def get_fed_server():
+    global _fed_server
+    if _fed_server is None:
+        model_path = os.path.join(os.path.dirname(__file__), "model.json")
+        _fed_server = FederatedServer(model_path)
+    return _fed_server
+
+@app.route("/api/fedavg", methods=["POST"])
+@login_required
+@csrf.exempt
+def fedavg_receive():
+    """Receive gradient update from a patient edge device."""
+    data = request.get_json()
+    if not data or "weight_deltas" not in data:
+        return jsonify({"error": "Invalid gradient payload"}), 400
+    
+    server = get_fed_server()
+    pending = server.receive_update(data)
+    
+    # Auto-aggregate when we have 2+ client updates
+    if pending >= 2:
+        result = server.aggregate(min_clients=2)
+        if result:
+            logger.info(f"FedAvg round {server.round_number} completed")
+            return jsonify({
+                "status": "aggregated",
+                "round": server.round_number,
+                "clients": result.get("contributing_clients")
+            })
+    
+    return jsonify({"status": "received", "pending": pending})
+
+@app.route("/api/global_model")
+@csrf.exempt
+def global_model():
+    """Serve the current global model weights for edge devices."""
+    server = get_fed_server()
+    model = server.get_global_model()
+    if model:
+        return jsonify(model)
+    return jsonify({"error": "Model not available"}), 404
+
+@app.route("/api/fed_status")
+@login_required
+@csrf.exempt
+def fed_status():
+    """Return federated learning status."""
+    server = get_fed_server()
+    return jsonify(server.get_status())
+
+# ── Multi-Patient Admin View ─────────────────────────────────
+@app.route("/patients")
+@login_required
+def patients_view():
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Get all patients (users with entries)
+    c.execute("""
+        SELECT u.id, u.username,
+               COUNT(e.id) as reading_count,
+               MAX(e.timestamp) as last_reading,
+               p.display_name, p.blood_type, p.age, p.bmi
+        FROM users u
+        LEFT JOIN entries e ON u.id = e.user_id
+        LEFT JOIN profiles p ON u.id = p.user_id
+        GROUP BY u.id
+        ORDER BY last_reading DESC
+    """)
+    patients = c.fetchall()
+    
+    # Get risk distribution per patient
+    c.execute("""
+        SELECT user_id, risk, COUNT(*) as cnt
+        FROM entries
+        GROUP BY user_id, risk
+    """)
+    risk_data = c.fetchall()
+    risk_by_patient = {}
+    for r in risk_data:
+        uid = r["user_id"]
+        if uid not in risk_by_patient:
+            risk_by_patient[uid] = {}
+        risk_by_patient[uid][r["risk"]] = r["cnt"]
+    
+    return render_template("patients.html",
+                          patients=patients,
+                          risk_by_patient=risk_by_patient)
+
 # ── Error Handlers ────────────────────────────────────────────
 @app.errorhandler(429)
 def ratelimit_handler(e):

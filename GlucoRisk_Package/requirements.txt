@@ -11,3 +11,4 @@ flask-limiter
 reportlab
 gunicorn
 paho-mqtt
+cryptography

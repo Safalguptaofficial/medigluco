@@ -14,8 +14,12 @@ from flask import (Flask, render_template, request, redirect, url_for,
                    session, flash, g, Response, jsonify, send_file)
 import sqlite3
 from werkzeug.security import generate_password_hash, check_password_hash
+import hmac
+import hashlib
 
 from glucorisk_app import GlucoRiskApp, FIELD_HINTS, ACTIVITY_LABELS
+from audit import init_audit_table, log_audit, audit_route, AuditAction
+from encryption import encrypt_field, decrypt_field
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -77,7 +81,10 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL
+        password TEXT NOT NULL,
+        role TEXT DEFAULT 'patient',
+        failed_attempts INTEGER DEFAULT 0,
+        locked_until TEXT DEFAULT NULL
     )
     ''')
     c.execute('''
@@ -111,19 +118,37 @@ def init_db():
         FOREIGN KEY(user_id) REFERENCES users(id)
     )
     ''')
-    # Add source column if upgrading from old schema
-    try:
-        c.execute("ALTER TABLE entries ADD COLUMN source TEXT DEFAULT 'form'")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS consents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        consent_type TEXT NOT NULL,
+        granted_at TEXT,
+        revoked_at TEXT DEFAULT NULL,
+        ip_address TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    ''')
+    # Schema migration for older DBs
+    for col, default in [("source", "'form'"), ("role", "'patient'"),
+                         ("failed_attempts", "0"), ("locked_until", "NULL")]:
+        try:
+            table = "entries" if col == "source" else "users"
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT DEFAULT {default}")
+        except sqlite3.OperationalError:
+            pass
+    init_audit_table(conn)
     conn.commit()
 
 def setup():
     init_db()
-    logger.info("Database initialized")
+    logger.info("Database initialized with clinical tables")
 
-# ── Auth ──────────────────────────────────────────────────────
+# ── Auth + RBAC + Password Policy ─────────────────────────────
 USERNAME_RE = re.compile(r'^[a-zA-Z0-9_]{3,30}$')
+PASSWORD_RE = re.compile(r'^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=]).{8,}$')
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
 
 def login_required(f):
     @wraps(f)
@@ -133,11 +158,79 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def role_required(*roles):
+    """Decorator to restrict route to specific roles (admin, doctor, patient)."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if "user_id" not in session:
+                return redirect(url_for("login"))
+            user_role = session.get("role", "patient")
+            if user_role not in roles:
+                flash("Access denied: insufficient permissions", "danger")
+                return redirect(url_for("dashboard"))
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def jwt_required(f):
+    """Decorator for edge device API auth via Bearer token."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Allow session auth (browser) OR JWT (edge device)
+        if "user_id" in session:
+            return f(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+            payload = verify_jwt(token)
+            if payload:
+                g.jwt_user = payload
+                return f(*args, **kwargs)
+        return jsonify({"error": "Authentication required"}), 401
+    return decorated
+
+def generate_jwt(user_id, username, role="patient"):
+    """Simple HMAC-SHA256 JWT for edge devices."""
+    import base64
+    header = base64.urlsafe_b64encode(json.dumps({"alg":"HS256","typ":"JWT"}).encode()).decode().rstrip("=")
+    exp = int(time.time()) + 86400  # 24h
+    payload_data = {"user_id": user_id, "username": username, "role": role, "exp": exp}
+    payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
+    secret = app.secret_key
+    sig = hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).hexdigest()
+    return f"{header}.{payload}.{sig}"
+
+def verify_jwt(token):
+    """Verify HMAC-SHA256 JWT."""
+    import base64
+    try:
+        parts = token.split(".")
+        if len(parts) != 3: return None
+        header, payload, sig = parts
+        secret = app.secret_key
+        expected = hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected): return None
+        pad = lambda s: s + "=" * (-len(s) % 4)
+        data = json.loads(base64.urlsafe_b64decode(pad(payload)))
+        if data.get("exp", 0) < time.time(): return None
+        return data
+    except Exception:
+        return None
+
 def query_user(username):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE username = ?", (username,))
     return c.fetchone()
+
+def is_account_locked(user):
+    """Check if account is locked due to failed attempts."""
+    locked = user["locked_until"] if "locked_until" in user.keys() else None
+    if locked:
+        if datetime.fromisoformat(locked) > datetime.now():
+            return True
+    return False
 
 # ── Routes ────────────────────────────────────────────────────
 @app.route("/")
@@ -161,8 +254,8 @@ def register():
             flash("Username must be 3-30 characters, alphanumeric and underscores only", "warning")
             return redirect(url_for("register"))
         
-        if len(password) < 6:
-            flash("Password must be at least 6 characters", "warning")
+        if not PASSWORD_RE.match(password):
+            flash("Password must be 8+ chars with 1 uppercase, 1 digit, and 1 special character (!@#$%^&*)", "warning")
             return redirect(url_for("register"))
         
         if query_user(username):
@@ -172,10 +265,18 @@ def register():
         hashed = generate_password_hash(password)
         conn = get_db()
         c = conn.cursor()
-        c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed))
+        
+        # Check if first user → auto-promote to admin
+        c.execute("SELECT COUNT(*) as cnt FROM users")
+        is_first = c.fetchone()["cnt"] == 0
+        role = "admin" if is_first else "patient"
+        
+        c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                  (username, hashed, role))
         conn.commit()
-        logger.info(f"New user registered: {username}")
-        flash("Registration successful, please log in.", "success")
+        log_audit(AuditAction.REGISTER, "users", f"New {role}: {username}")
+        logger.info(f"New user registered: {username} (role={role})")
+        flash(f"Registration successful{' (admin)' if is_first else ''}. Please log in.", "success")
         return redirect(url_for("login"))
     return render_template("register.html")
 
@@ -186,13 +287,41 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         user = query_user(username)
+        
+        if user and is_account_locked(user):
+            log_audit(AuditAction.LOGIN_FAILED, "auth", f"Account locked: {username}", severity="WARNING")
+            flash(f"Account locked. Try again after {LOCKOUT_MINUTES} minutes.", "danger")
+            return redirect(url_for("login"))
+        
         if user and check_password_hash(user["password"], password):
+            # Reset failed attempts on success
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (user["id"],))
+            conn.commit()
+            
             session.permanent = True
             session["user_id"] = user["id"]
             session["username"] = user["username"]
-            logger.info(f"User logged in: {username}")
+            session["role"] = user["role"] if "role" in user.keys() else "patient"
+            log_audit(AuditAction.LOGIN_SUCCESS, "auth", f"Role: {session['role']}")
+            logger.info(f"User logged in: {username} (role={session['role']})")
             return redirect(url_for("dashboard"))
         else:
+            # Increment failed attempts
+            if user:
+                conn = get_db()
+                c = conn.cursor()
+                attempts = (user["failed_attempts"] or 0) + 1
+                locked = None
+                if attempts >= MAX_FAILED_ATTEMPTS:
+                    from datetime import timedelta
+                    locked = (datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
+                    log_audit(AuditAction.ACCOUNT_LOCKED, "auth", f"Locked: {username}", severity="CRITICAL")
+                c.execute("UPDATE users SET failed_attempts=?, locked_until=? WHERE id=?",
+                          (attempts, locked, user["id"]))
+                conn.commit()
+            log_audit(AuditAction.LOGIN_FAILED, "auth", f"Failed: {username}", severity="WARNING")
             logger.warning(f"Failed login attempt for: {username}")
             flash("Invalid credentials", "danger")
             return redirect(url_for("login"))
@@ -576,7 +705,7 @@ def global_model():
     return jsonify({"error": "Model not available"}), 404
 
 @app.route("/api/fed_status")
-@login_required
+@jwt_required
 @csrf.exempt
 def fed_status():
     """Return federated learning status."""
@@ -621,6 +750,149 @@ def patients_view():
     return render_template("patients.html",
                           patients=patients,
                           risk_by_patient=risk_by_patient)
+
+_app_start_time = time.time()
+
+# ── Health Check Endpoints (Clinical Monitoring) ─────────────
+@app.route("/health")
+@csrf.exempt
+def health_check():
+    """Readiness probe: checks DB connection, model, and uptime."""
+    checks = {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("SELECT 1")
+        conn.close()
+        checks["database"] = "ok"
+    except Exception:
+        checks["database"] = "error"
+    
+    model_path = os.path.join(os.path.dirname(__file__), "model.json")
+    checks["model"] = "ok" if os.path.exists(model_path) else "missing"
+    checks["serial"] = "connected" if app_logic.ser else "disconnected"
+    checks["uptime_seconds"] = int(time.time() - _app_start_time)
+    checks["status"] = "healthy" if all(v in ("ok", "connected", "disconnected") for v in [checks["database"], checks["model"]]) else "degraded"
+    
+    code = 200 if checks["status"] == "healthy" else 503
+    return jsonify(checks), code
+
+@app.route("/health/live")
+@csrf.exempt
+def health_live():
+    """Liveness probe: always returns 200."""
+    return jsonify({"status": "alive"}), 200
+
+# ── JWT Token Endpoint (Edge Device Auth) ─────────────────────
+@app.route("/api/auth/token", methods=["POST"])
+@csrf.exempt
+@limiter.limit("10 per minute")
+def issue_token():
+    """Issue JWT for edge device authentication. No browser session needed."""
+    data = request.get_json() or {}
+    username = data.get("username", "")
+    password = data.get("password", "")
+    
+    user = query_user(username)
+    if not user or not check_password_hash(user["password"], password):
+        log_audit(AuditAction.LOGIN_FAILED, "jwt_auth", f"JWT denied: {username}", severity="WARNING")
+        return jsonify({"error": "Invalid credentials"}), 401
+    
+    if is_account_locked(user):
+        return jsonify({"error": "Account locked"}), 423
+    
+    role = user["role"] if "role" in user.keys() else "patient"
+    token = generate_jwt(user["id"], user["username"], role)
+    log_audit(AuditAction.LOGIN_SUCCESS, "jwt_auth", f"JWT issued for: {username}")
+    return jsonify({"token": token, "expires_in": 86400, "role": role})
+
+# ── Consent Management ────────────────────────────────────────
+CONSENT_TYPES = ["data_collection", "sms_alerts", "telemetry_sharing", "research_use"]
+
+@app.route("/consent", methods=["GET", "POST"])
+@login_required
+def consent_page():
+    conn = get_db()
+    c = conn.cursor()
+    
+    if request.method == "POST":
+        consent_type = request.form.get("consent_type", "")
+        action = request.form.get("action", "")
+        
+        if consent_type not in CONSENT_TYPES:
+            flash("Invalid consent type", "warning")
+            return redirect(url_for("consent_page"))
+        
+        if action == "grant":
+            c.execute("INSERT INTO consents (user_id, consent_type, granted_at, ip_address) VALUES (?,?,?,?)",
+                      (session["user_id"], consent_type, datetime.now().isoformat(), request.remote_addr))
+            log_audit(AuditAction.CONSENT_GRANT, "consents", f"Granted: {consent_type}")
+            flash(f"Consent granted: {consent_type}", "success")
+        elif action == "revoke":
+            c.execute("UPDATE consents SET revoked_at=? WHERE user_id=? AND consent_type=? AND revoked_at IS NULL",
+                      (datetime.now().isoformat(), session["user_id"], consent_type))
+            log_audit(AuditAction.CONSENT_REVOKE, "consents", f"Revoked: {consent_type}")
+            flash(f"Consent revoked: {consent_type}", "warning")
+        conn.commit()
+        return redirect(url_for("consent_page"))
+    
+    # Get current consents
+    c.execute("SELECT consent_type, granted_at, revoked_at FROM consents WHERE user_id=? ORDER BY granted_at DESC",
+              (session["user_id"],))
+    all_consents = c.fetchall()
+    
+    # Build active consent state
+    active = {}
+    for ct in CONSENT_TYPES:
+        active[ct] = any(r["consent_type"] == ct and r["revoked_at"] is None for r in all_consents)
+    
+    return render_template("consent.html", consent_types=CONSENT_TYPES, active=active, history=all_consents)
+
+# ── Password Change ───────────────────────────────────────────
+@app.route("/change_password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "POST":
+        current = request.form.get("current_password", "")
+        new_pwd = request.form.get("new_password", "")
+        confirm = request.form.get("confirm_password", "")
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT password FROM users WHERE id=?", (session["user_id"],))
+        user = c.fetchone()
+        
+        if not check_password_hash(user["password"], current):
+            flash("Current password is incorrect", "danger")
+            return redirect(url_for("change_password"))
+        
+        if new_pwd != confirm:
+            flash("New passwords don't match", "warning")
+            return redirect(url_for("change_password"))
+        
+        if not PASSWORD_RE.match(new_pwd):
+            flash("Password must be 8+ chars with 1 uppercase, 1 digit, and 1 special character", "warning")
+            return redirect(url_for("change_password"))
+        
+        c.execute("UPDATE users SET password=? WHERE id=?",
+                  (generate_password_hash(new_pwd), session["user_id"]))
+        conn.commit()
+        log_audit(AuditAction.PASSWORD_CHANGE, "users", "Password changed")
+        flash("Password changed successfully", "success")
+        return redirect(url_for("dashboard"))
+    
+    return render_template("change_password.html")
+
+# ── Audit Log Viewer (Admin Only) ─────────────────────────────
+@app.route("/admin/audit")
+@login_required
+@role_required("admin")
+def audit_viewer():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 100")
+    logs = c.fetchall()
+    return render_template("audit.html", logs=logs)
+
 
 # ── Error Handlers ────────────────────────────────────────────
 @app.errorhandler(429)

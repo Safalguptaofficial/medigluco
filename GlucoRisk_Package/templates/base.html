@@ -3,10 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="GlucoRisk — Real-time glucose risk monitoring with ML inference and ESP8266 IoT sensors">
   <title>GlucoRisk Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E💉%3C/text%3E%3C/svg%3E">
 
   <!-- Bootstrap -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Bootstrap Icons -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
   <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <!-- Google Fonts -->
@@ -34,6 +38,24 @@
       
       --glass-blur: blur(12px);
     }
+
+    /* Light Mode */
+    [data-theme="light"] {
+      --bg:        #f0f2f5;
+      --bg-gradient: radial-gradient(circle at top right, #e8ecf1, #f0f2f5 60%);
+      --surface:   rgba(255, 255, 255, 0.85);
+      --surface2:  rgba(240, 242, 245, 0.9);
+      --border:    rgba(0, 0, 0, 0.1);
+      --accent:    #0088ff;
+      --accent-glow: rgba(0, 136, 255, 0.3);
+      --text:      #1e293b;
+      --muted:     #64748b;
+    }
+    [data-theme="light"] body { color: var(--text); }
+    [data-theme="light"] .navbar { background: rgba(255,255,255,0.85) !important; }
+    [data-theme="light"] .form-control, [data-theme="light"] .form-select { background: rgba(255,255,255,0.8); color: var(--text); }
+    [data-theme="light"] .glucotoast { background: rgba(255,255,255,0.92); }
+    [data-theme="light"] body::before, [data-theme="light"] body::after { opacity: 0.07; }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -332,6 +354,13 @@
     <a class="navbar-brand" href="{{ url_for('dashboard') }}">Gluco<span>Risk</span></a>
     <div class="ms-auto d-flex align-items-center gap-3">
       <!-- Notification bell -->
+      <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode"
+        style="background:none;border:1px solid var(--border);border-radius:8px;
+               padding:5px 12px;cursor:pointer;font-size:13px;color:var(--muted);
+               display:flex;align-items:center;gap:6px;transition:all 0.2s">
+        <span id="theme-icon">🌙</span>
+        <span style="font-family:'DM Mono',monospace;font-size:11px" id="theme-label">dark</span>
+      </button>
       <button id="notif-btn" onclick="requestNotifPermission()" title="Enable mobile notifications"
         style="background:none;border:1px solid var(--border);border-radius:8px;
                padding:5px 12px;cursor:pointer;font-size:13px;color:var(--muted);
@@ -340,6 +369,8 @@
         <span id="notif-label" style="font-family:'DM Mono',monospace;font-size:11px">notify</span>
       </button>
       <span class="nav-user">{{ session.get('username') }}</span>
+      <a href="{{ url_for('profile') }}" class="nav-link" title="Patient Profile"><i class="bi bi-person-badge"></i></a>
+      <a href="{{ url_for('history_page') }}" class="nav-link" title="History"><i class="bi bi-clock-history"></i></a>
       <a href="{{ url_for('logout') }}" class="nav-link">logout</a>
     </div>
   </div>
@@ -529,6 +560,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     setTimeout(() => handlePrediction(d.risk, d.score, d.advice, d.glucose), 400);
   }
 });
+
+// ── 8. Dark/Light Mode Toggle ────────────────────────
+function toggleTheme() {
+  const html = document.documentElement;
+  const current = html.getAttribute('data-theme') || 'dark';
+  const next = current === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('glucorisk-theme', next);
+  updateThemeBtn(next);
+}
+
+function updateThemeBtn(theme) {
+  const icon = document.getElementById('theme-icon');
+  const label = document.getElementById('theme-label');
+  if (icon && label) {
+    icon.textContent = theme === 'dark' ? '🌙' : '☀️';
+    label.textContent = theme;
+  }
+}
+
+// Apply saved theme on load
+(function() {
+  const saved = localStorage.getItem('glucorisk-theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', saved);
+  updateThemeBtn(saved);
+})();
 </script>
 </body>
 </html>

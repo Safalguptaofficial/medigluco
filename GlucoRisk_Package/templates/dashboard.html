@@ -3,8 +3,8 @@
 {% block content %}
 
 <!-- Audio elements for risk alerts -->
-<audio id="alert-high" src="{{ url_for('static', filename='alert_high.mp3') }}" preload="auto"></audio>
-<audio id="alert-moderate" src="{{ url_for('static', filename='alert_moderate.mp3') }}" preload="auto"></audio>
+<audio id="alert-high" src="{{ url_for('static', filename='alert_high.wav') }}" preload="auto"></audio>
+<audio id="alert-moderate" src="{{ url_for('static', filename='alert_moderate.wav') }}" preload="auto"></audio>
 
 <div class="d-flex justify-content-between align-items-center mb-4 fade-in header-controls flex-wrap">
   <div>
@@ -467,6 +467,9 @@
 
       // Update all charts
       allCharts.forEach(c => c.update());
+
+      // Auto-persist to DB every 10 readings
+      if (typeof autoPersist === 'function') autoPersist(data);
     };
 
     // SSE reconnection with exponential backoff
@@ -610,6 +613,43 @@
         });
     };
   });
+
+  // ── Keyboard Shortcuts ──────────────────────
+  document.addEventListener('keydown', function(e) {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+    switch(e.key.toLowerCase()) {
+      case 'd': administerTreatment('dextrose'); break;
+      case 'i': administerTreatment('insulin'); break;
+      case 'm': new bootstrap.Modal(document.getElementById('overrideModal')).show(); break;
+      case 'p': window.location.href = '/api/export_pdf'; break;
+    }
+  });
+
+  // ── Auto-Persist Telemetry (every 10 readings) ──
+  let persistCounter = 0;
+  let lastPersistData = null;
+
+  function autoPersist(data) {
+    persistCounter++;
+    lastPersistData = data;
+    if (persistCounter % 10 === 0 && data.inputs && data.result) {
+      fetch('/api/persist_telemetry', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          timestamp: new Date().toISOString(),
+          glucose: data.inputs.glucose,
+          heart_rate: data.inputs.heart_rate,
+          spo2: data.inputs.spo2,
+          gsr: data.inputs.gsr,
+          stress: data.inputs.stress || 0,
+          risk: data.result.risk,
+          score: data.result.score,
+          source: data.source || 'sse'
+        })
+      }).catch(() => {});
+    }
+  }
 </script>
 
 <style>

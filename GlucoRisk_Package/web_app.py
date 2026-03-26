@@ -99,6 +99,18 @@ def init_db():
         FOREIGN KEY(user_id) REFERENCES users(id)
     )
     ''')
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS profiles (
+        user_id INTEGER PRIMARY KEY,
+        display_name TEXT DEFAULT '',
+        age REAL DEFAULT 25,
+        bmi REAL DEFAULT 22,
+        emergency_contact TEXT DEFAULT '',
+        blood_type TEXT DEFAULT '',
+        allergies TEXT DEFAULT '',
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    ''')
     # Add source column if upgrading from old schema
     try:
         c.execute("ALTER TABLE entries ADD COLUMN source TEXT DEFAULT 'form'")
@@ -413,6 +425,109 @@ def dashboard():
         FIELD_HINTS=FIELD_HINTS,
         ACTIVITY_LABELS=ACTIVITY_LABELS,
     )
+
+# ── Patient Profile ───────────────────────────────────────────
+@app.route("/profile", methods=["GET", "POST"])
+@login_required
+def profile():
+    conn = get_db()
+    c = conn.cursor()
+    
+    if request.method == "POST":
+        display_name = request.form.get("display_name", "").strip()[:50]
+        age = float(request.form.get("age", 25))
+        bmi = float(request.form.get("bmi", 22))
+        emergency_contact = request.form.get("emergency_contact", "").strip()[:20]
+        blood_type = request.form.get("blood_type", "").strip()[:5]
+        allergies = request.form.get("allergies", "").strip()[:200]
+        
+        c.execute("SELECT user_id FROM profiles WHERE user_id = ?", (session["user_id"],))
+        if c.fetchone():
+            c.execute(
+                "UPDATE profiles SET display_name=?, age=?, bmi=?, emergency_contact=?, blood_type=?, allergies=? WHERE user_id=?",
+                (display_name, age, bmi, emergency_contact, blood_type, allergies, session["user_id"])
+            )
+        else:
+            c.execute(
+                "INSERT INTO profiles (user_id, display_name, age, bmi, emergency_contact, blood_type, allergies) VALUES (?,?,?,?,?,?,?)",
+                (session["user_id"], display_name, age, bmi, emergency_contact, blood_type, allergies)
+            )
+        conn.commit()
+        logger.info(f"Profile updated for user {session['username']}")
+        flash("Profile saved successfully", "success")
+        return redirect(url_for("profile"))
+    
+    c.execute("SELECT * FROM profiles WHERE user_id = ?", (session["user_id"],))
+    prof = c.fetchone()
+    
+    c.execute("SELECT COUNT(*) as cnt FROM entries WHERE user_id = ?", (session["user_id"],))
+    entry_count = c.fetchone()["cnt"]
+    
+    return render_template("profile.html", profile=prof, entry_count=entry_count)
+
+# ── History Page ──────────────────────────────────────────────
+@app.route("/history")
+@login_required
+def history_page():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT timestamp, glucose, heart_rate, spo2, gsr, risk, score, source "
+        "FROM entries WHERE user_id = ? ORDER BY timestamp DESC LIMIT 200",
+        (session["user_id"],)
+    )
+    entries = c.fetchall()
+    return render_template("history.html", entries=entries)
+
+# ── Auto-Persist Telemetry ────────────────────────────────────
+@app.route("/api/persist_telemetry", methods=["POST"])
+@login_required
+@csrf.exempt
+def persist_telemetry():
+    """Auto-save SSE telemetry data to DB (called from frontend every N readings)."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error"}), 400
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO entries (user_id, timestamp, glucose, heart_rate, gsr, spo2, stress, age, bmi, activity, risk, score, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            session["user_id"],
+            data.get("timestamp", datetime.now().isoformat()),
+            data.get("glucose"), data.get("heart_rate"), data.get("gsr"),
+            data.get("spo2"), data.get("stress", 0), data.get("age", 25),
+            data.get("bmi", 22), data.get("activity", 0),
+            data.get("risk", "NORMAL"), data.get("score", 0),
+            data.get("source", "sse")
+        )
+    )
+    conn.commit()
+    return jsonify({"status": "saved"})
+
+# ── Session Stats ─────────────────────────────────────────────
+@app.route("/api/stats")
+@login_required
+@csrf.exempt
+def api_stats():
+    """Return session statistics for the current user."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*) as cnt, "
+        "MIN(glucose) as min_glu, MAX(glucose) as max_glu, AVG(glucose) as avg_glu, "
+        "MIN(heart_rate) as min_hr, MAX(heart_rate) as max_hr, AVG(heart_rate) as avg_hr, "
+        "MIN(spo2) as min_spo2, MAX(spo2) as max_spo2, AVG(spo2) as avg_spo2, "
+        "SUM(CASE WHEN risk='HIGH_RISK' THEN 1 ELSE 0 END) as high_count, "
+        "SUM(CASE WHEN risk='MODERATE_RISK' THEN 1 ELSE 0 END) as mod_count, "
+        "SUM(CASE WHEN risk='NORMAL' THEN 1 ELSE 0 END) as normal_count "
+        "FROM entries WHERE user_id = ?",
+        (session["user_id"],)
+    )
+    row = c.fetchone()
+    return jsonify(dict(row) if row else {})
 
 # ── Error Handlers ────────────────────────────────────────────
 @app.errorhandler(429)

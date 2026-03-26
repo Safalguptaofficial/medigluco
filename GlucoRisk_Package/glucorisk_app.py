@@ -6,10 +6,12 @@ Dependencies: pip install pyserial rich
 """
 
 import serial, serial.tools.list_ports
-import json, threading, time, sys, os
+import json, threading, time, sys, os, logging
 from datetime import datetime
 from collections import deque
 from twilio.rest import Client
+
+logger = logging.getLogger("glucorisk.engine")
 
 try:
     from rich.console import Console
@@ -77,7 +79,7 @@ class GlucoRiskApp:
     def _load_model(self):
         model_path = os.path.join(os.path.dirname(__file__), "model.json")
         if not os.path.exists(model_path):
-            print(f"Warning: model.json not found at {model_path}")
+            logger.warning(f"model.json not found at {model_path}")
             return None
         with open(model_path) as f:
             return json.load(f)
@@ -438,7 +440,7 @@ class GlucoRiskApp:
             to_num = os.environ.get('TWILIO_TO_NUMBER')
             
             if not all([account_sid, auth_token, from_num, to_num]) or to_num == "+1234567890":
-                print("Missing or default Twilio credentials in environment. Skipping SMS.")
+                logger.warning("Missing or default Twilio credentials. Skipping SMS.")
                 return
                 
             client = Client(account_sid, auth_token)
@@ -455,9 +457,9 @@ class GlucoRiskApp:
             )
             
             message = client.messages.create(body=msg, from_=from_num, to=to_num)
-            print(f"SMS Alert dispatched (SID: {message.sid}, Status: {message.status}) to {to_num} for patient {username}")
+            logger.info(f"SMS Alert dispatched (SID: {message.sid}, Status: {message.status}) to {to_num} for patient {username}")
         except Exception as e:
-            print(f"Failed to send SMS alert: {e}")
+            logger.error(f"Failed to send SMS alert: {e}")
 
     # ── Main Loop ────────────────────────────────────────────
     def run(self):

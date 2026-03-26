@@ -8,6 +8,7 @@
     <div class="auth-sub">Create your secure monitoring account</div>
 
     <form method="POST" action="{{ url_for('register') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
       <div class="mb-4">
         <label class="form-label" for="username">Choose Username</label>
         <div class="input-group">

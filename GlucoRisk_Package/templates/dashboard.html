@@ -167,6 +167,10 @@
           <i class="bi bi-droplet-fill me-2"></i>Push 5U Fast-Acting Insulin <span class="badge bg-dark float-end">Manual</span>
         </button>
       </div>
+      <hr class="border-secondary my-3">
+      <a href="/api/export_pdf" class="btn btn-outline-light text-start p-3 fw-bold w-100">
+        <i class="bi bi-file-earmark-pdf me-2"></i>Export Clinical PDF Report <span class="badge bg-dark float-end">Download</span>
+      </a>
       <div id="intervention-status" class="mt-3 text-center small text-success fw-bold" style="min-height: 20px;"></div>
     </div>
   </div>
@@ -465,8 +469,17 @@
       allCharts.forEach(c => c.update());
     };
 
+    // SSE reconnection with exponential backoff
+    let reconnectDelay = 1000;
     evtSource.onerror = function() {
-      document.getElementById('live-insight').innerHTML = "<span class='text-danger'>⚠️ STREAM DISCONNECTED. Attempting to reconnect...</span>";
+      document.getElementById('live-insight').innerHTML = "<span class='text-danger'>⚠️ STREAM DISCONNECTED. Reconnecting in " + (reconnectDelay/1000) + "s...</span>";
+      evtSource.close();
+      setTimeout(() => {
+        const newSource = new EventSource("{{ url_for('stream') }}");
+        newSource.onmessage = evtSource.onmessage;
+        newSource.onerror = evtSource.onerror;
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      }, reconnectDelay);
     };
 
     // --- Interactive Callbacks ---

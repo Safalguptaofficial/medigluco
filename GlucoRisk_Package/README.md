@@ -1,76 +1,94 @@
-# 🩺 GlucoRisk — TinyML on ESP32
+# GlucoRisk — Real-Time Glucose Risk Monitoring Platform
 
-Predicts hypoglycemia / glucose spike risk using a trained MLP neural network running **on the ESP32 chip**.
+[![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
+[![Flask](https://img.shields.io/badge/Flask-3.x-green.svg)](https://flask.palletsprojects.com)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Model Info
-| Property | Value |
-|---|---|
-| Architecture | MLP 8 → 16 → 8 → 4 |
-| Dataset size | 3,000 samples |
-| Accuracy | **92%** |
-| Classes | NORMAL, LOW_RISK, MODERATE_RISK, HIGH_RISK |
-| Inference time | ~0.5ms on ESP32 |
+Real-time clinical glucose risk monitoring system with **ESP8266 IoT sensor integration**, **MLP neural network inference**, and a **live 5-chart ICU dashboard**.
 
-## Input Features
-| # | Feature | Range | Source |
-|---|---|---|---|
-| 1 | Blood Glucose | 30–400 mg/dL | CGM / manual |
-| 2 | Heart Rate | 40–200 BPM | Manual |
-| 3 | GSR (Skin Conductance) | 0–1023 | Manual |
-| 4 | SpO₂ | 80–100 % | Manual |
-| 5 | Stress Level | 1–10 | Manual |
-| 6 | Age | 18–90 years | Manual |
-| 7 | BMI | 15–50 | Manual |
-| 8 | Activity Level | 0–3 | Manual |
+## Features
 
-## Setup
+- **Real-Time Monitoring** — SSE-powered live dashboard with 5 synchronized charts (Glucose, HR, SpO2, GSR, Risk Score)
+- **Hardware Integration** — ESP8266 + MAX30102 (HR/SpO2) + MPU6050 (accelerometer) via serial JSON
+- **ML Risk Prediction** — MLP neural network (8→16→8→4) classifies: NORMAL, LOW_RISK, MODERATE_RISK, HIGH_RISK
+- **Auto Mode Switching** — Seamlessly toggles between hardware and simulation when sensors connect/disconnect
+- **SMS Alerts** — Twilio-powered SMS alerts on HIGH_RISK with 5-minute cooldown
+- **PDF Export** — Generate downloadable clinical PDF reports
+- **Security** — CSRF protection, rate limiting, session hardening, PBKDF2 password hashing
+- **Docker Ready** — Production deployment with Gunicorn + nginx
 
-### ESP32 (Arduino IDE)
-1. Open `GlucoRisk_ESP32/GlucoRisk_ESP32.ino`
-2. Select board: **ESP32 Dev Module**
-3. Upload — no libraries needed (pure math, no sensor libs)
+## Quick Start
 
-### Python CLI App
 ```bash
-pip install pyserial rich
-python glucorisk_app.py           # auto-detect port
-python glucorisk_app.py COM3      # specify port (Windows)
-python glucorisk_app.py /dev/ttyUSB0  # Linux/Mac
-```
-Works in **offline mode** too (local Python inference, no ESP32 needed).
+# Clone
+git clone https://github.com/Safalguptaofficial/GlucoRisk.git
+cd GlucoRisk/GlucoRisk_Package
 
-### Web Dashboard
-A Flask-based web interface provides user registration/login and a dashboard
-with historical charts of glucose spikes.
+# Install
+pip install -r requirements.txt
 
-Dependencies:
-```bash
-pip install flask werkzeug
-```
+# Configure
+cp .env.example .env  # Edit with your Twilio credentials
 
-Run with:
-```bash
+# Run
 python web_app.py
-```
-Then visit `http://127.0.0.1:5000` in your browser.  The application will
-create a `glucorisk.db` SQLite database on first start.  Use the **Register**
-page to create an account, then log in and enter patient measurements.  The
-results and time-series plots are shown on the dashboard.
-
-## Serial Protocol
-```
-PC → ESP32:  GLU:95.0|HR:72.0|GSR:500|SPO2:98.5|STRESS:3.0|AGE:35|BMI:25.0|ACT:0\n
-ESP32 → PC:  {"risk":"NORMAL","score":99,"probs":[99,0,0,0],"advice":"..."}\n
+# Open http://localhost:5001
 ```
 
-## Retrain Model
+## Docker Deployment
+
 ```bash
-python train_model.py
-# → generates model_weights.h (paste into .ino) and model.json (for Python app)
+docker compose up --build -d
+# Access at http://localhost
 ```
 
-## Clinical Overrides (always applied on top of ML)
-- Glucose < 54 → always HIGH_RISK
-- Glucose > 250 → always HIGH_RISK  
-- Glucose < 70 → minimum MODERATE_RISK
-- Glucose > 180 → minimum LOW_RISK
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `FLASK_SECRET_KEY` | Session encryption key |
+| `TWILIO_ACCOUNT_SID` | Twilio Account SID |
+| `TWILIO_AUTH_TOKEN` | Twilio Auth Token |
+| `TWILIO_FROM_NUMBER` | Twilio sender number |
+| `TWILIO_TO_NUMBER` | Alert recipient number |
+
+## API Endpoints
+
+| Method | Route | Description |
+|---|---|---|
+| GET | `/api/status` | Hardware & system health check |
+| GET | `/api/history?limit=100` | Telemetry history (JSON) |
+| GET | `/api/export_pdf` | Download clinical PDF report |
+| POST | `/inject_telemetry` | Manual sensor override |
+| POST | `/administer_treatment` | Administer dextrose/insulin |
+
+## ML Model
+
+- **Algorithm**: MLP Classifier (scikit-learn)
+- **Architecture**: Input(8) → Hidden(16, ReLU) → Hidden(8, ReLU) → Output(4, Softmax)
+- **Features**: glucose, heart_rate, gsr, spo2, stress, age, bmi, activity
+- **Training**: 3000 balanced synthetic samples with physiological correlations
+
+## Hardware
+
+- **Board**: ESP8266 NodeMCU
+- **Sensors**: MAX30102 (HR + SpO2), MPU6050 (accelerometer)
+- **Protocol**: Serial JSON at 115200 baud
+- **Firmware**: `GlucoRisk_ESP32/GlucoRisk_ESP32.ino`
+
+## Project Structure
+
+```
+├── Dockerfile / docker-compose.yml / nginx.conf
+└── GlucoRisk_Package/
+    ├── web_app.py              # Flask routes + security
+    ├── glucorisk_app.py        # ML inference + serial + SSE
+    ├── train_model.py          # Model training pipeline
+    ├── model.json              # Trained weights
+    ├── templates/              # Dashboard, login, register
+    └── GlucoRisk_ESP32/        # Arduino firmware
+```
+
+## License
+
+MIT

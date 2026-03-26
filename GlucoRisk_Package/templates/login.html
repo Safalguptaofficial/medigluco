@@ -8,6 +8,7 @@
     <div class="auth-sub">Sign in to your intelligent monitoring dashboard</div>
 
     <form method="POST" action="{{ url_for('login') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
       <div class="mb-4">
         <label class="form-label" for="username">Username</label>
         <div class="input-group">

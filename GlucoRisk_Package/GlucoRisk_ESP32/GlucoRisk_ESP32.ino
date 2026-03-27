@@ -175,6 +175,9 @@ void connectWiFi() {
 // SETUP
 // ═══════════════════════════════════════════════
 
+bool max_ok = false;
+bool mpu_ok = false;
+
 void setup() {
   Serial.begin(115200);
   Serial.println("{\"status\":\"booting\",\"mode\":\"tinyml_edge\"}");
@@ -184,21 +187,28 @@ void setup() {
   snprintf(TOPIC_ALERT,  sizeof(TOPIC_ALERT),  "glucorisk/patient/%s/alert",  PATIENT_ID);
   snprintf(TOPIC_MODEL,  sizeof(TOPIC_MODEL),  "glucorisk/patient/%s/config", PATIENT_ID);
 
+  // WIRING NOTE:
+  // Both sensors MUST be connected to the SAME I2C pins!
+  // MAX30102 SDA -> D2, SCL -> D1
+  // MPU6050  SDA -> D2, SCL -> D1
   Wire.begin(D2, D1);
 
   // MAX30102 sensor
   if (!particleSensor.begin(Wire)) {
-    Serial.println("{\"error\":\"MAX30102 not found\"}");
-    while (1);
+    Serial.println("{\"hw_error\":\"MAX30102 not found. Check wiring (SDA=D2, SCL=D1).\"}");
+  } else {
+    max_ok = true;
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x2F);
+    particleSensor.setPulseAmplitudeGreen(0);
   }
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x2F);
-  particleSensor.setPulseAmplitudeGreen(0);
 
   // MPU6050 sensor
   mpu.initialize();
   if (!mpu.testConnection()) {
-    Serial.println("{\"error\":\"MPU6050 not found\"}");
+    Serial.println("{\"hw_error\":\"MPU6050 not found. Check wiring (SDA=D2, SCL=D1).\"}");
+  } else {
+    mpu_ok = true;
   }
 
   // WiFi + MQTT (non-blocking — works without WiFi too)
@@ -222,84 +232,95 @@ void loop() {
   }
 
   // ── Read Sensors ──
-  long irValue = particleSensor.getIR();
-
-  // Heart rate peak detection
-  if (irValue > prevIR + 500) rising = true;
-  if (rising && irValue < prevIR) {
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
-    float bpm = 60.0 / (delta / 1000.0);
-    if (bpm > 50 && bpm < 150) {
-      beatAvg = (beatAvg * 0.7) + (bpm * 0.3);
+  long irValue = 0;
+  if (max_ok) {
+    irValue = particleSensor.getIR();
+    // Heart rate peak detection
+    if (irValue > prevIR + 500) rising = true;
+    if (rising && irValue < prevIR) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      float bpm = 60.0 / (delta / 1000.0);
+      if (bpm > 50 && bpm < 150) {
+        beatAvg = (beatAvg * 0.7) + (bpm * 0.3);
+      }
+      rising = false;
     }
-    rising = false;
+    prevIR = irValue;
   }
-  prevIR = irValue;
 
   // SpO2 estimation
   int spo2 = 0;
   bool fingerDetected = (irValue > 50000);
-  if (fingerDetected) {
+  if (fingerDetected && max_ok) {
     spo2 = 95 + random(0, 4);
   }
 
   // Accelerometer → activity level
-  int16_t ax, ay, az;
-  mpu.getAcceleration(&ax, &ay, &az);
-  float accel = sqrt((float)(ax*ax) + (float)(ay*ay) + (float)(az*az)) / 16384.0;
+  float accel = 0.0;
   int activity = 0;
-  if (accel >= 2.0) activity = 3;
-  else if (accel >= 1.5) activity = 2;
-  else if (accel >= 1.1) activity = 1;
+  if (mpu_ok) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    accel = sqrt((float)(ax*ax) + (float)(ay*ay) + (float)(az*az)) / 16384.0;
+    if (accel >= 2.0) activity = 3;
+    else if (accel >= 1.5) activity = 2;
+    else if (accel >= 1.1) activity = 1;
+  }
 
   // ── TinyML Inference (on-device) ──
+  int risk_class = 0;
+  int score = 0;
+  float glucose = 100.0;
+  float gsr = 400.0;
+  
   if (fingerDetected && beatAvg > 0) {
-    // Simulate glucose/GSR (no physical sensor — would come from CGM in production)
-    float glucose = 100 + random(-20, 40);
-    float gsr = 400 + random(0, 300);
+    glucose = 100 + random(-20, 40);
+    gsr = 400 + random(0, 300);
     float stress = constrain(gsr / 100.0, 1, 10);
+    risk_class = predict_risk(glucose, beatAvg, gsr, spo2, stress, patient_age, patient_bmi, activity);
+    score = (int)(risk_class * 33.3);
+  }
 
-    // Run MLP on-device
-    int risk_class = predict_risk(glucose, beatAvg, gsr, spo2,
-                                   stress, patient_age, patient_bmi, activity);
-    int score = (int)(risk_class * 33.3);
+  // Build JSON payload
+  StaticJsonDocument<512> doc;
+  doc["patient_id"] = PATIENT_ID;
+  doc["heart_rate"] = fingerDetected ? (int)beatAvg : 0;
+  doc["spo2"] = fingerDetected ? spo2 : 0;
+  doc["accel"] = accel;
+  doc["activity"] = activity;
+  doc["glucose"] = glucose;
+  doc["gsr"] = (int)gsr;
+  doc["risk_edge"] = RISK_LABELS[risk_class];
+  doc["score_edge"] = score;
+  doc["source"] = "tinyml_edge";
+  doc["ir"] = irValue;
+  doc["finger"] = fingerDetected;
+  
+  if (!max_ok || !mpu_ok) {
+    doc["hw_error"] = "Sensor missing. Connect SDA to D2, SCL to D1";
+  }
 
-    // Build JSON payload
-    StaticJsonDocument<512> doc;
-    doc["patient_id"] = PATIENT_ID;
-    doc["heart_rate"] = (int)beatAvg;
-    doc["spo2"] = spo2;
-    doc["accel"] = accel;
-    doc["activity"] = activity;
-    doc["glucose"] = glucose;
-    doc["gsr"] = (int)gsr;
-    doc["risk_edge"] = RISK_LABELS[risk_class];
-    doc["score_edge"] = score;
-    doc["source"] = "tinyml_edge";
-    doc["ir"] = irValue;
+  // Always output to serial (fallback when no WiFi)
+  serializeJson(doc, Serial);
+  Serial.println();
 
-    // Always output to serial (fallback when no WiFi)
-    serializeJson(doc, Serial);
-    Serial.println();
+  // Publish to MQTT fog gateway if connected
+  if (mqttClient.connected() && fingerDetected && beatAvg > 0) {
+    char buffer[512];
+    serializeJson(doc, buffer);
+    mqttClient.publish(TOPIC_VITALS, buffer);
 
-    // Publish to MQTT fog gateway if connected
-    if (mqttClient.connected()) {
-      char buffer[512];
-      serializeJson(doc, buffer);
-      mqttClient.publish(TOPIC_VITALS, buffer);
-
-      // Publish alert if HIGH_RISK
-      if (risk_class == 3) {
-        StaticJsonDocument<128> alert;
-        alert["patient_id"] = PATIENT_ID;
-        alert["risk"] = "HIGH_RISK";
-        alert["score"] = score;
-        alert["glucose"] = glucose;
-        char alertBuf[128];
-        serializeJson(alert, alertBuf);
-        mqttClient.publish(TOPIC_ALERT, alertBuf);
-      }
+    // Publish alert if HIGH_RISK
+    if (risk_class == 3) {
+      StaticJsonDocument<128> alert;
+      alert["patient_id"] = PATIENT_ID;
+      alert["risk"] = "HIGH_RISK";
+      alert["score"] = score;
+      alert["glucose"] = glucose;
+      char alertBuf[128];
+      serializeJson(alert, alertBuf);
+      mqttClient.publish(TOPIC_ALERT, alertBuf);
     }
   }
 

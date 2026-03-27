@@ -110,10 +110,15 @@ class GlucoRiskApp:
                     if raw.startswith("{"):
                         hw_data = json.loads(raw)
                         # ESP8266 sends: heart_rate, spo2, accel, activity
-                        if "heart_rate" in hw_data and hw_data["heart_rate"] > 0:
-                            self.ser_data = hw_data
+                        is_edge = hw_data.get("source") == "tinyml_edge" or "hw_error" in hw_data
+                        
+                        if is_edge or "heart_rate" in hw_data:
                             self.last_hardware_time = time.time()
-            except Exception:
+                            if "hw_error" in hw_data:
+                                console.print(f"[red]Hardware Error from ESP: {hw_data['hw_error']}[/red]")
+                                # Keep old data but mark hardware online
+                            else:
+                                self.ser_data = hw_data
                 pass
             time.sleep(0.1)
 
